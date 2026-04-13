@@ -1,0 +1,74 @@
+---
+description: "Core commands and workflows for this Python/FastAPI/LangGraph repo."
+alwaysApply: false
+---
+
+# Tooling
+
+- Python 3.11+
+- Package manager: `uv` or `poetry` (pick one and keep it consistent)
+- Framework: FastAPI
+- Agentic stack: LangChain + LangGraph
+- Observability: OpenTelemetry (OTLP exporter)
+- Docs/diagrams: Markdown + Mermaid
+
+# Commands
+
+Assuming `uv` and a monorepo layout; adjust names if your scripts differ.
+
+- `uv sync` – Install dependencies (equivalent to pip/poetry install)
+- `uv run uvicorn app.main:app --reload`  
+  or `make dev-api` – Run FastAPI backend in dev mode
+- `uv run pytest` – Run unit tests
+- `uv run ruff check .` – Lint Python code
+- `uv run black .` – Format Python code
+- `uv run mypy .` – Optional static type checking
+- `make graph-dev` / `uv run python -m app.graphs.dev` – Run LangGraph workflows in dev (if you add a helper)
+
+If there are multiple services, prefer using `make` or top-level scripts (e.g., `scripts/`) to coordinate them rather than calling deep module paths.
+
+# Project structure (target / ideal)
+
+- `app/`
+  - `main.py` – FastAPI app entrypoint
+  - `api/` – Routers for HTTP endpoints
+  - `core/` – Config, logging, OTel setup
+  - `domain/` – Tenant, policy, personas, registries
+    - `personas/`
+    - `skills/`
+    - `agents_registry/`
+    - `tools_registry/`
+    - `policy/`
+  - `agents/` – LangGraph/LangChain agents & graphs per domain
+    - `pm/`
+    - `scrum/`
+    - `support/`
+    - `marketing/`
+    - `hr/`
+  - `memory/` – Vector DB + RAG logic
+  - `telemetry/` – OpenTelemetry config, instrumentors
+
+- `docs/`
+  - `AGENTIC_ARCHITECTURE.md` – Canonical architecture
+  - `diagrams/` – Mermaid `.mmd` files + exported images
+
+- `.cursor/` – Cursor config (rules, skills, environment)
+
+# Workflow
+
+When adding a **new coworker** (e.g., “Delivery Manager”):
+
+1. Define or update **Skills** in `app/domain/skills/` (+ Skill Registry).
+2. Attach those skills to one or more **Agents** in `app/agents/<domain>/` via their manifests / configuration (supportedSkills).
+3. Add or update **policy** in `app/domain/policy/` so tenants/personas can enable/disable these skills.
+4. Update **Planner** prompts / graph definitions so it can choose the new skills for relevant personas.
+5. Expose the relevant workflows from FastAPI in `app/api/`.
+
+When changing **LangGraph** flows:
+
+- Keep graphs under `app/agents/` and expose them via small adapter functions in `app/api/` or `app/core/langgraph_adapter.py`.
+- Use LangGraph’s checkpointers/state management as recommended, and ensure execution IDs are tagged in OTel spans.
+
+After significant automated changes:
+
+- Run `uv run ruff check .`, `uv run black .`, and `uv run pytest` and fix failures.

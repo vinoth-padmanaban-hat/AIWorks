@@ -1,0 +1,667 @@
+---
+alwaysApply: false
+---
+
+You are a senior AI + backend architect helping our team implement a multi-tenant, multi-agent AI coworker platform using:
+
+- Python 3.11+
+- FastAPI for HTTP APIs
+- LangChain and LangGraph for agentic workflows
+- OpenTelemetry (OTel) for tracing/metrics
+- Mermaid for diagrams in docs
+
+Your job:
+
+- Understand and respect the architecture described in this file.
+- When asked for designs, code, refactors, or docs, always align with this architecture.
+- Do NOT collapse everything into a single “agent”; keep persona, skills, agents, tools, and policies cleanly separated.
+- Use clear Python types (Pydantic models), FastAPI endpoints, and LangGraph graphs, and always describe context flow explicitly.
+
+========================================
+
+1. # High-level Architecture
+
+We are building an "agentic infrastructure" that provides N AI coworkers across multiple domains (e.g., digital marketing analyst, HR exec, customer support, scrum master, project manager).
+
+We split the system into:
+
+1. Experience & Ingress Layer
+   - API Gateway / BFF / UI.
+   - Handles auth, tenant resolution, rate limiting.
+
+2. Control Plane (stateless or mostly stateless)
+   - Persona Store
+   - Skill / Capability Registry
+   - Agent Registry
+   - Tool / MCP Registry (control-plane-as-a-tool)
+   - Orchestrator
+   - Planner
+   - Execution Engine
+   - Guardrails & Evaluator
+   - Observability & Cost
+
+3) Data Plane (stateful / domain-specific)
+   - Domain Agents (microservices / MCP servers)
+   - Tools (MCP servers, APIs, DBs, queues)
+   - Memory & Data:
+     - Relational DB: PostgreSQL (multi-tenant, transactional data, registries, policies)
+     - Vector DB: pgvector-in-Postgres or external vector store (RAG, long-term memory)
+
+Key principle:
+
+- Control Plane = discovery, planning, routing, policy, observability.
+- Data Plane = doing actual domain work via agents + tools.
+- All runtime wiring happens via registries and metadata, not hardcoded lists.
+
+# ======================================== 2. Core Concepts and Relationships
+
+We distinguish 4 main abstractions:
+
+- Persona = WHO the AI is acting as.
+- Skill/Capability = WHAT can be done (abstract, reusable know-how).
+- Agent = WHO executes skills at runtime (a worker/microservice).
+- Tool = HOW concrete actions happen (APIs, DBs, MCP servers).
+
+These have 3 registry-like stores:
+
+- Persona Store → catalog of personas.
+- Skill Registry → catalog of abstract skills, independent of agents.
+- Agent Registry → catalog of agents that implement one or more skills.
+- Tool/MCP Registry → catalog of tools, mostly MCP servers.
+
+=== 2.1 Persona ===
+
+Persona defines identity and high-level behavior:
+
+- Fields (conceptually):
+  - persona_id
+  - tenant_id
+  - display_name
+  - role_description (who this coworker is)
+  - tone_style (analytical, friendly, etc.)
+  - goals (what it tries to optimize)
+  - constraints (safety, compliance, domain limits)
+  - default_skills (suggested skills to prefer)
+  - guardrail_profile (which guardrails to apply)
+
+Usage:
+
+- Orchestrator loads persona at the start of each execution.
+- Planner uses persona to bias which skills to pick and how to structure plans.
+- Agents may use persona summary to tune tone/formatting, but persona is not tied to any single agent implementation.
+
+Persona is stored in a Persona Store service (backed by DB). It is read-only at runtime.
+
+=== 2.2 Skill / Capability ===
+
+Skill is a reusable, implementation-agnostic "verb" + know-how package:
+
+- Fields (conceptually):
+  - skill_id (globally unique)
+  - name, description
+  - input_schema (JSON Schema)
+  - output_schema (JSON Schema)
+  - examples (optional few-shot / test cases)
+  - tags (domain, read-only vs write, risk category)
+  - safety_level
+  - documentation_url
+
+Important:
+
+- Skills define WHAT to do and HOW in terms of workflow, validation steps, output structure, but NOT WHO executes it or WHICH tools are used.
+- Skills are reusable across agents, personas, and products.
+- Skills are versioned independently of agents.
+
+Skill Registry:
+
+- Read-only service for runtime:
+  - GET /skills, GET /skills/{skill_id}
+- Planner uses this registry to plan in terms of skills, not concrete agents.
+
+=== 2.3 Agent ===
+
+Agent is a runtime worker (microservice / MCP-based service) that implements one or more skills using tools and models.
+
+An Agent Registry entry includes:
+
+- agent_id
+- display_name
+- description
+- version
+- endpoint (MCP / HTTP / gRPC base URL)
+- protocol (e.g., "mcp")
+- supported_skills: list of (skill_id, quality_score?, cost_profile?)
+- collections / scopes: which tenants or environments can see this agent
+- security_schemes: how to authenticate
+- owner_ids / managed_by: for governance & approvals
+- health_status: OK / degraded / offline
+- latency_estimate, cost_estimate
+
+Key relationships:
+
+- ONE skill can be implemented by MANY agents (e.g., cheap vs high-quality, or tenant-specific variants).
+- ONE agent can implement MANY skills (cohesive domain area).
+- We do NOT enforce 1 skill = 1 agent.
+- The Agent Registry is the only source of truth for "which worker implements which skills".
+
+Agents themselves:
+
+- Are deployed as services (e.g., FastAPI + MCP server).
+- Have their own observability and scaling.
+- Use a Tool/MCP client to talk to tools.
+
+=== 2.4 Tool ===
+
+Tool is a concrete integration or primitive operation:
+
+- Usually exposed via MCP servers or HTTP/gRPC APIs.
+- Represented in a Tool/MCP Registry with:
+  - tool_id, name, description
+  - endpoint, protocol ("mcp", "http_json", etc.)
+  - operations (names + JSON Schemas)
+  - risk_level (read-only / write / destructive)
+  - auth model (service account, user OAuth, etc.)
+  - tenant_scopes
+  - logging and rate-limit policies
+
+Agents discover and use tools at runtime through a ToolRegistry / MCP client.
+
+# ======================================== 3. Control Plane: Services and Context Flow
+
+We have three main control-plane services that coordinate everything:
+
+- Orchestrator
+- Planner
+- Execution Engine
+
+Plus the three registries and guardrails/evaluator.
+
+=== 3.1 API Gateway → Orchestrator (Ingress) ===
+
+1. API Gateway authenticates incoming request and resolves:
+   - tenant_id
+   - user_id
+   - optionally persona_id
+   - creates request_id / trace_id
+
+2. For each new "job":
+   - Orchestrator generates execution_id.
+   - Loads persona and short-term memory:
+     - GET Persona (Persona Store)
+     - GET conversation / execution context (Memory service)
+
+3. Orchestrator builds a "planning context":
+   - tenant_id
+   - execution_id
+   - persona (full object)
+   - goal (user input, possibly structured)
+   - short_term_context (summaries, recent actions)
+   - allowed_skills (from Skill Registry, filtered by tenant & policy)
+   - any high-level policy flags (read-only vs write, etc.)
+
+It passes this planning context to the Planner.
+
+=== 3.2 Planner ===
+
+Input:
+
+- planning_context as above.
+
+Responsibilities:
+
+- Interpret user goal + persona.
+- Pick which skills to use (based on Skill Registry metadata, tags, schemas).
+- Decide ordering and dependencies of skills (plan graph).
+- Apply patterns:
+  - Single-path vs multi-path plan
+  - One-shot vs incremental planning
+  - Optional reflection (self / cross / human)
+
+Output:
+
+- A PLAN that references ONLY skill_ids, not agents or tools.
+
+Example plan structure:
+
+- plan {
+  steps: [
+  { step_id, skill_id, input, depends_on, can_parallelize, reflection? },
+  ...
+  ]
+  }
+
+No agent-specific info is baked into the plan.
+
+=== 3.3 Orchestrator → Execution Engine ===
+
+Orchestrator sends:
+
+- execution_id
+- tenant_id
+- persona summary (or pointer)
+- plan (the graph of skill-based steps)
+
+Execution Engine is now responsible for actually running the plan by resolving skills → agents and calling agents → tools.
+
+=== 3.4 Execution Engine ===
+
+For each runnable step in the plan:
+
+1. Take step.skill_id.
+
+2. Call Agent Registry:
+   - GET /agents?skill_id=...&tenant_id=...
+   - Receive candidate agent manifests.
+
+3. Apply routing logic:
+   - Filter by:
+     - health_status
+     - tenant / collection
+     - cost / latency
+     - policy (is this high-risk write skill? require approved agent)
+   - Pick the best agent.
+
+4. Build an "AgentInvocationContext" object:
+
+   {
+   execution_id,
+   step_id,
+   tenant_id,
+   user_id,
+   persona_summary,
+   skill_id,
+   skill_input, // conforms to skill.input_schema
+   short_term_context, // from memory service
+   long_term_context_refs, // doc/memory IDs
+   trace_id
+   }
+
+5. Invoke the agent's endpoint (often MCP server fronted by HTTP/gRPC):
+   - For MCP: send a "tool" or "command" with structured args and context.
+   - Agent internally decides how to use its tools and skills to solve the step.
+
+6. Receive structured result, validate it against skill.output_schema.
+
+7. Persist step output, update execution state, emit telemetry.
+
+8. When all steps are done, Execution Engine composes final output (or returns results to Orchestrator to do final formatting).
+
+Context invariants:
+
+- tenant_id, execution_id, step_id are carried through every call for traceability.
+- persona is summarized and passed as needed, but not deep-copied everywhere.
+- skills are referenced by ID only; their definitions live in the Skill Registry.
+- agents are discovered via Agent Registry, not hardcoded.
+
+# ======================================== 4. Agent Microservice Design
+
+Each agent is a domain microservice with internal structure similar to modern coding agents (e.g., OpenDev):
+
+- Startup / scaffolding:
+  - Load config: supported skill_ids, model, allowed tools.
+  - Resolve tools via MCP / Tool Registry.
+  - Prepare system prompt templates, tool schemas, and skill-specific prompts.
+  - Optionally define sub-agents (planner, reviewer) internally.
+
+- Runtime handling per request:
+  - Accept AgentInvocationContext.
+  - Build LLM context:
+    - System instructions: domain role, safety rules.
+    - Persona summary: style/tone constraints.
+    - Skill instructions: from skill metadata (SKILL.md or equivalent).
+    - Tool schemas: only allowed tools for this agent & skill.
+    - Relevant memory/docs: loaded via MCP tools or Memory service.
+  - Run a controlled loop:
+    - Think → choose tool → call via MCP → observe → iterate.
+    - Respect guardrails and validation.
+  - Return structured JSON that matches the skill.output_schema.
+
+Agents never:
+
+- Decide which other agents to call (that's orchestrator / execution engine).
+- Register themselves to random tenants; they register once to Agent Registry with proper metadata and scopes.
+
+# ======================================== 5. Registries and Multi-Tenancy
+
+=== Persona Store ===
+
+- Keyed by (tenant_id, persona_id).
+- Orchestrator reads once per execution.
+
+=== Skill Registry ===
+
+- Global catalog, but may support tenant-specific overlays.
+- Planner reads skills and IO schemas, filtered by tenant capabilities/policy.
+
+=== Agent Registry ===
+
+- Inspired by Entra Agent metadata:
+  - Agents belong to collections (akin to tenant/environment groups).
+  - Discovery is always scoped by collection / tenant.
+- Execution Engine uses it to find agents that implement a given skill.
+
+=== Tool / MCP Registry ===
+
+- Catalog of MCP servers and tools.
+- Control-plane-as-a-tool:
+  - Agents see one "control_plane" tool (or a few simple tools) which routes to specific MCP servers/tools behind the scenes.
+- Provides centralized governance, rate-limiting, and audit around tool usage.
+
+Multi-tenancy:
+
+- tenant_id is threaded through:
+  - Gateway
+  - Orchestrator
+  - Planner (for skill filtering)
+  - Execution Engine
+  - Agent & Tool invocations (for credentials, data scopes)
+
+# ======================================== 6. Storage & Memory (Postgres + Vector DB)
+
+We use two main storage layers:
+
+1. PostgreSQL (relational DB)
+   - Purpose:
+     - Tenants, users, and personas
+     - Skill Registry (skills table)
+     - Agent Registry (agents + supported_skills join)
+     - Tool/MCP Registry
+     - Tenant & persona policies
+     - Execution metadata (execution_id, step_id, status, timestamps)
+     - Optional: audit logs and summarized telemetry
+   - Multi-tenancy:
+     - Default approach: shared schema with a `tenant_id` column on all tenant-owned rows.
+     - Enforce isolation with:
+       - Application-level checks on `tenant_id`, and
+       - Optional Postgres Row-Level Security (RLS) where appropriate.
+     - Future options:
+       - Schema-per-tenant or DB-per-tenant for high isolation if needed.
+
+2. Vector DB (long-term memory & RAG)
+   - Default: pgvector inside PostgreSQL, or an external vector store (e.g., Qdrant/Weaviate/etc.).
+   - Purpose:
+     - Store embeddings and metadata for:
+       - Documents (knowledge bases, brand guidelines, playbooks)
+       - Execution traces / summaries
+       - Domain-specific artifacts (tickets, campaigns, code, etc.)
+   - Access:
+     - All vector access goes through a Memory service in `app/domain/memory/`.
+     - Agents and orchestrator NEVER talk to the vector store directly.
+     - The Memory service enforces:
+       - tenant_id scoping,
+       - data classification tags (for policy),
+       - retrieval strategies (top-k, filters, reranking).
+
+Memory patterns:
+
+- Short-term memory:
+  - Fast, ephemeral store (Postgres table or cache) keyed by execution_id and step_id.
+  - Used for conversation snippets, intermediate results, working state.
+
+- Long-term memory:
+  - Vector + underlying documents in object storage or Postgres.
+  - Used for RAG, historical context, and cross-execution learning.
+
+Rules for devs:
+
+- If it is **configuration, registry, policy, or transactional**, put it in PostgreSQL.
+- If it is **semantic search / retrieval / long-term context**, put it in the Memory layer (vector store + doc store).
+- Never embed ad-hoc persistence inside agents; always go through the Memory API or domain repositories.
+
+# ======================================== 7. How to Use This Architecture in Implementation
+
+When you (the assistant) generate code, designs, or explanations for devs:
+
+1. Keep abstractions clean:
+   - Persona: identity & intent.
+   - Skills: abstract capabilities with schemas & procedures.
+   - Agents: worker microservices implementing skills via tools.
+   - Tools: MCP / API primitives.
+   - Orchestrator/Planner/Execution Engine: composition & routing, not domain logic.
+
+2. When designing a new feature:
+   - First, express it as one or more skills (with input/output schemas).
+   - Next, decide which agent(s) should implement those skills.
+   - Register or update those agents in the Agent Registry.
+   - Only then wire it into Planner (so it can pick the new skills when appropriate).
+
+3. When writing sample code:
+   - Show DTOs/types for Persona, Skill, AgentManifest, ToolManifest, Plan, Execution, Step.
+   - Show how context flows: tenant_id, execution_id, skill_id, agent_id, tool_id.
+   - Do NOT shortcut by embedding skills or tools directly into the orchestrator.
+
+4. When in doubt:
+   - Use skills for reusable domain workflows and know-how.
+   - Use agents for autonomous multi-step execution.
+   - Use tools for concrete side effects and external calls.
+   - Use registries for discovery, not hardcoded lists.
+
+Always generate designs and code that reflect this separation of concerns and context flow.
+
+# ======================================== 8. Planning, Skills, and Policy (LLM + Planner + Policy)
+
+This section refines how planning works, how skills are treated, and how tenant/persona policies are enforced.
+
+High-level principles:
+
+- Planner MUST plan only using skills that are both:
+  - Present in the Skill Registry, AND
+  - Allowed by tenant/persona policy at that time.
+- Skill = reusable unit of work: a portable capability definition (WHAT + HOW in abstract) with IO schemas.
+- Tenant/Persona Policy = explicit rules that decide:
+  - Which skills/capabilities are allowed/blocked.
+  - Which tools/platforms can be used.
+  - Where human approval or extra evaluation is required.
+- LLM (reasoning) + Planner (skill-level planning) + Policy (constraints) =>
+  Safe, predictable, enterprise-ready behavior.
+
+========================================
+8.1 Skills are reusable units of work
+========================================
+
+Reinforce this mental model:
+
+- A Skill is a reusable, implementation-agnostic capability:
+  - Encodes WHAT to do and HOW in terms of steps / workflow / IO schemas.
+  - Does NOT specify WHICH agent or WHICH tools must be used.
+- Skills are designed to be reused across:
+  - Different agents (cheap vs premium, tenant-specific, vendor-specific).
+  - Different personas (PM coworker, Scrum Master coworker, Support coworker).
+  - Different tenants (subject to policy).
+
+Implementation note:
+
+- Skills live in the Skill Registry and/or as SKILL directories/files (SKILL.md + metadata).
+- Agents merely declare "I implement Skill X, Y, Z".
+- Execution Engine chooses which agent to use per skill at runtime, via the Agent Registry.
+
+========================================
+8.2 Planner’s action space = allowed skills
+========================================
+
+The Planner MUST treat the set of skills it sees as a CLOSED action space for this execution.
+
+Workflow:
+
+1. Orchestrator loads:
+   - Tenant policy
+   - Persona-level overrides (if any)
+
+2. Orchestrator queries Skill Registry for candidate skills:
+   - E.g., by domain tags, tenant, persona.
+
+3. Policy Engine filters candidate skills:
+   - Produces allowedSkills = { skills that are ENABLED and NOT BLOCKED for this tenant/persona }.
+
+4. Planner is called with:
+   - goal (user request)
+   - persona summary
+   - allowedSkills: ONLY these skills are legal operators
+   - short-term context (conversation/history, memory summaries)
+
+Planner MUST:
+
+- Build a plan using ONLY skill_ids from allowedSkills.
+- Never invent new skill names or depend on capabilities not present in allowedSkills.
+- If the goal cannot be satisfied with allowedSkills:
+  - Either return a “capability not available” outcome, OR
+  - Fall back to a clearly-labeled “generic text-only answer” path that does NOT call tools (read-only).
+
+Prompt requirement for Planner:
+
+- Always tell the Planner explicitly:
+  - "Here is the list of allowed skills. You MUST only use these skills in your plan. Do NOT invent new capabilities or tools."
+
+========================================
+8.3 Tenant & Persona Policy: what is allowed or blocked
+========================================
+
+We model policy as explicit rules per tenant (and optionally per persona) that define:
+
+- Which capabilities/skills are allowed or blocked.
+- Which platforms/models/tools/agents are allowed or blocked.
+- When human approval is required.
+- Cost limits and security constraints.
+
+Conceptual schema (language-agnostic):
+
+- tenantId: string
+
+- capabilities:
+  allowed: [ capabilityId ] // typically equals Skill.id or capability-group IDs
+  blocked: [ capabilityId ]
+  allowedTags?: [ string ] // e.g., ["read_only", "pm"]
+  blockedTags?: [ string ]
+  defaultAllow?: boolean // usually false in enterprise
+
+- platforms:
+  allowed: [ platformId ] // e.g., "azure_openai", "aws_bedrock", "local_ollama"
+  blocked: [ platformId ]
+  preferred?: [ platformId ] // for routing cost/latency
+
+- tools:
+  allowedTools?: [ toolId ]
+  blockedTools?: [ toolId ]
+
+- agents:
+  allowedAgents?: [ agentId ]
+  blockedAgents?: [ agentId ]
+
+- budget:
+  monthlyUsdLimit?: number
+  perExecutionUsdLimit?: number
+  maxTokensPerExecution?: number
+  softLimitNotifications?: boolean
+
+- security:
+  allowExternalApiCalls: boolean
+  allowWebScraping: boolean
+  allowSensitiveDataAccess: boolean
+  allowedDataTags?: [ string ] // data classification tags allowed
+  blockedDataTags?: [ string ]
+
+- governance:
+  requireHumanApprovalForCapabilities: [ capabilityId ]
+  requireHumanApprovalForTools?: [ toolId ]
+  approverRoles?: [ string ]
+
+- evaluation:
+  autoEvaluateCapabilities?: [ capabilityId ]
+  minQualityScore?: number
+  logAllExecutionsForCapabilities?: [ capabilityId ]
+
+Persona-level policies:
+
+- PersonaPolicyOverride with same shape but partial:
+  - allowedCapabilities / blockedCapabilities
+  - plus overrides for tools/agents/platforms if needed.
+
+Runtime policy:
+
+- EffectivePolicy = merge(systemDefaults, tenantPolicy, personaPolicyOverride) with clear precedence:
+  - systemDefaults < tenantPolicy < personaOverride
+
+========================================
+8.4 Where Policy is enforced in the pipeline
+========================================
+
+Enforce policy at multiple stages, not just once:
+
+1. Pre-planning (Skill visibility)
+   - Orchestrator + Policy Engine:
+     - Compute allowedSkills using Skill Registry + EffectivePolicy.
+   - Planner ONLY receives allowedSkills.
+
+2. Planning (LLM-level constraints)
+   - Planner prompt explicitly restricts to allowedSkills.
+   - Planner must return plans that reference ONLY those skill_ids.
+
+3. Pre-execution (Step & agent selection)
+   - Execution Engine verifies each plan step:
+     - step.skillId is still allowed by policy at that moment.
+   - When choosing agents for a skill:
+     - Filter Agent Registry results by:
+       - EffectivePolicy.agents allowed/blocked lists.
+       - Collections (tenant / environment).
+
+4. Tool invocation (within agents)
+   - Before an agent can call a tool (MCP server):
+     - ToolId is checked against EffectivePolicy.tools & security flags.
+   - If a tool or skill requires human approval:
+     - Execution Engine (or a Governance service) pauses and emits an approval task.
+     - Only proceeds when an approver role has approved.
+
+5. Guardrails and Evaluation
+   - Guardrails service enforces content & safety for inputs/outputs.
+   - Evaluation rules determine which capabilities must be regularly auto-evaluated and logged.
+
+========================================
+8.5 Implementation guidance for devs
+========================================
+
+When you implement or modify the system:
+
+- Treat **skills as reusable units of work**:
+  - Define or update a Skill separately in the Skill Registry.
+  - Multiple agents can implement the same Skill.
+  - Planners and policies refer to skills by ID (and tags).
+
+- Treat **agents as workers behind skills**:
+  - In AgentManifest.supportedSkills, always reference skills by skillId.
+  - Do NOT hardcode skill logic into the orchestrator.
+
+- Always run **planning through policy**:
+  - Never call Planner with “all skills”; always pass a filtered allowedSkills list from Policy + Skill Registry.
+  - If adding a new skill, ensure it can be enabled/disabled by policy per tenant/persona.
+
+- Always run **execution through policy**:
+  - Before executing a step:
+    - Check that its skillId, chosen agentId, and any tools adhere to EffectivePolicy.
+  - If a capability or tool is marked as requiring human approval:
+    - Insert explicit approval steps (e.g., via workflow/task queue).
+
+- Keep the LLM “dumb but powerful”:
+  - LLM is powerful at reasoning, but not trusted to self-govern.
+  - Planner + Policy + Guardrails wrap the LLM so that decisions and actions always stay inside allowed skills, tools, and constraints.
+
+The rule of thumb:
+
+- You NEVER trust “raw” LLM calls to decide what they are allowed to do.
+- You ALWAYS constrain them with:
+  - (1) an explicit list of allowed skills/capabilities, and
+  - (2) an explicit Policy Engine for tenant/persona rules.
+
+# Multi-tenant Databases (Rules)
+
+- We use **one control plane DB** for platform metadata and **one data DB per tenant** for domain data.
+- Control plane DB:
+  - Tenants, DB connections, registries, global policy/templates, scheduler.
+- Tenant DBs:
+  - No `tenant_id` columns are required on tenant tables; the database boundary is the tenant boundary.
+  - Use the same schema across all tenant DBs so migrations are consistent.
+
+When generating or modifying code:
+
+- Never mix control plane tables and tenant tables in the same database.
+- Always resolve `tenant_id → tenant DB connection` via the control plane DB before running tenant-specific logic.
+- Keep normalized schemas (e.g., `articles`) stable and push tenant-specific shapes into JSON fields (e.g., `formatted_articles.formatted_json`).

@@ -1,0 +1,83 @@
+---
+description: "Code style and patterns for Python/FastAPI/LangChain/LangGraph."
+alwaysApply: false
+---
+
+# General Python style
+
+- Target Python 3.11+.
+- Follow PEP 8 with `ruff` + `black` enforcing style.
+- Use type hints everywhere, especially on public functions and FastAPI endpoints.
+- Use `pydantic.BaseModel` for request/response DTOs and domain schemas.
+
+Formatting & linting:
+
+- `ruff` for linting; fix warnings or justify with `# noqa` sparingly.
+- `black` for formatting; do not fight it.
+- Optional: `mypy` for type checking; prefer `typing_extensions` for modern types if needed.
+
+# FastAPI
+
+- Single main app in `app/main.py`:
+  - Initialize logging + OTel.
+  - Include routers from `app/api/routers`.
+- Organize routers by domain (`pm`, `scrum`, `support`, etc.), not by HTTP verb.
+- Use Pydantic models for request/response bodies, with `response_model` on routes.
+- Validate all external inputs at boundaries, not inside business logic.
+
+Example pattern:
+
+- `app/api/pm_routes.py`
+- `app/agents/pm/graph.py`
+- `app/domain/skills/pm_skills.py`
+
+# LangChain & LangGraph
+
+- Use LangGraph for **orchestration** (graphs, state, parallelism).
+- Use LangChain primarily for:
+  - LLM wrappers
+  - tools integration
+  - retrieval (RAG)
+- Always separate:
+  - Graph definition (structure, nodes, edges, state).
+  - Node/agent implementations (functions/classes that use LangChain + tools).
+- Keep graphs composable:
+  - Use `StateGraph` and typed state.
+  - Avoid giant monolithic graphs; create subgraphs per domain and compose them.
+
+# Agents & Skills
+
+- Put domain agents/graphs under `app/agents/<domain>/`.
+- Put skill definitions under `app/domain/skills/` and keep them **implementation-agnostic**:
+  - Define Pydantic models for input/output.
+  - Do not reference specific agents or tools there.
+- Agent implementations should:
+  - Declare which skills they support.
+  - Use registry clients (SkillRegistry, AgentRegistry, ToolRegistry) instead of hardcoding.
+
+# OpenTelemetry
+
+- Initialize OTel in `app/core/telemetry.py`:
+  - FastAPI instrumentation.
+  - OTLP exporter.
+- For LangChain/LangGraph:
+  - Use OTel-compatible callback handlers so each chain/graph step is traced.
+- Always tag spans with:
+  - `tenant_id`, `execution_id`, `step_id`, `skill_id`, `agent_id` where available.
+
+# Testing
+
+- Use `pytest`.
+- Prefer small, focused tests for:
+  - Policy evaluation.
+  - Registry lookups (SkillRegistry, AgentRegistry).
+  - Planner helper functions.
+  - Individual LangGraph nodes (node functions) where possible.
+- Integration tests for:
+  - End-to-end flows through FastAPI + a minimal graph.
+
+# Security
+
+- Never hardcode secrets; use environment variables or dedicated secrets manager.
+- Always use `tenant_id` and `persona_id` as part of authorization decisions.
+- Do not let agents or tools bypass Policy Engine or registries.
