@@ -1,0 +1,126 @@
+# Development overrides — use with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#   make docker-up-dev
+#
+# - Bind-mounts Python source so edits on the host apply without rebuilding images.
+# - Enables uvicorn --reload on all backend services.
+# - WATCHFILES_FORCE_POLLING helps file watching on Docker Desktop (macOS/Windows).
+#
+# Next.js: run hot reload on the host (API stays in Docker):
+#   cd web && cp .env.local.example .env.local && npm install && npm run dev
+# (Ensure NEXT_PUBLIC_API_URL=http://127.0.0.1:8000)
+
+services:
+  control-plane:
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+      ]
+    volumes:
+      - ./app:/app/app
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./scripts:/app/scripts
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+
+  content-ingestion:
+    command:
+      [
+        "uvicorn",
+        "agents.content_ingestion.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+        "--reload",
+      ]
+    volumes:
+      - ./app:/app/app
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./scripts:/app/scripts
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+
+  scraper-mcp:
+    command:
+      [
+        "uvicorn",
+        "tools.scraper_mcp.server:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8002",
+        "--reload",
+      ]
+    volumes:
+      - ./app:/app/app
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./scripts:/app/scripts
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+
+  content-curator:
+    command:
+      [
+        "uvicorn",
+        "agents.content_curator.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8003",
+        "--reload",
+      ]
+    volumes:
+      - ./app:/app/app
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./scripts:/app/scripts
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+
+  generic-scraper:
+    command:
+      [
+        "uvicorn",
+        "agents.templates.scraper_main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8004",
+        "--reload",
+      ]
+    volumes:
+      - ./app:/app/app
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./scripts:/app/scripts
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+
+  generic-matcher:
+    command:
+      [
+        "uvicorn",
+        "agents.templates.matcher_main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8005",
+        "--reload",
+      ]
+    volumes:
+      - ./app:/app/app
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./scripts:/app/scripts
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"

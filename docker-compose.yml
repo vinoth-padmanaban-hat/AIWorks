@@ -1,0 +1,200 @@
+# AIWorks full stack: Postgres, Python services (8000–8005), Next.js (3000).
+#
+# Schema/migrations are NOT a long-lived service. Run once (idempotent) via:
+#   make docker-migrate
+# or use `make docker-up`, which starts Postgres, runs migrations, then starts the rest.
+#
+# Optional project-root .env is auto-loaded by Docker Compose for ${VAR} substitution only.
+# Copy docker/compose.env.example → .env and set OPENAI_API_KEY (required for LLM features).
+#
+# Plain `docker compose up -d` assumes Postgres is already migrated (or use make docker-up).
+# First-time DB: make docker-bootstrap  (register agents). Demo data: make docker-seed (skips if present).
+#
+# Dev (bind mounts + uvicorn --reload): docker-compose.dev.yml — see make docker-up-dev.
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: aiworks
+      POSTGRES_PASSWORD: aiworks
+      POSTGRES_DB: aiworks
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiworks -d aiworks"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # One-off migrations: `make docker-migrate` (not started by default `docker compose up -d`).
+  db-migrate:
+    profiles: ["migrate"]
+    image: postgres:16-bookworm
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: aiworks
+      PGPASSWORD: aiworks
+    volumes:
+      - ./db/migrations:/migrations:ro
+      - ./docker/init-db.sh:/init-db.sh:ro
+    entrypoint: ["/bin/sh", "/init-db.sh"]
+    restart: "no"
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aiworks-backend:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: &backend_env
+      DATABASE_URL: postgresql+asyncpg://aiworks:aiworks@postgres:5432/aiworks
+      TENANT_DB_BASE_URL: postgresql+asyncpg://aiworks:aiworks@postgres:5432
+      CONTENT_INGESTION_AGENT_URL: http://content-ingestion:8001
+      SCRAPER_MCP_URL: http://scraper-mcp:8002
+      CONTENT_CURATOR_AGENT_URL: http://content-curator:8003
+      GENERIC_SCRAPER_AGENT_URL: http://generic-scraper:8004
+      GENERIC_MATCHER_AGENT_URL: http://generic-matcher:8005
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
+      LANGFUSE_TRACING_ENVIRONMENT: ${LANGFUSE_TRACING_ENVIRONMENT:-}
+      INLINE_EVAL_ENABLED: ${INLINE_EVAL_ENABLED:-false}
+      INLINE_EVAL_MAX_RETRIES: ${INLINE_EVAL_MAX_RETRIES:-2}
+      INLINE_EVAL_THRESHOLD: ${INLINE_EVAL_THRESHOLD:-0.5}
+      INLINE_EVAL_METRIC_NAME: ${INLINE_EVAL_METRIC_NAME:-GoalAdequacy}
+      INGESTION_MAX_DEPTH_CAP: ${INGESTION_MAX_DEPTH_CAP:-2}
+      INGESTION_MAX_LINKS_PER_SOURCE: ${INGESTION_MAX_LINKS_PER_SOURCE:-100}
+      SCRAPER_HTTP_TIMEOUT_SECONDS: ${SCRAPER_HTTP_TIMEOUT_SECONDS:-600}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  content-ingestion:
+    image: aiworks-backend:latest
+    command: ["uvicorn", "agents.content_ingestion.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment: *backend_env
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  scraper-mcp:
+    image: aiworks-backend:latest
+    command: ["uvicorn", "tools.scraper_mcp.server:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment: *backend_env
+    ports:
+      - "8002:8002"
+    shm_size: "2gb"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  content-curator:
+    image: aiworks-backend:latest
+    command: ["uvicorn", "agents.content_curator.main:app", "--host", "0.0.0.0", "--port", "8003"]
+    environment: *backend_env
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  generic-scraper:
+    image: aiworks-backend:latest
+    command: ["uvicorn", "agents.templates.scraper_main:app", "--host", "0.0.0.0", "--port", "8004"]
+    environment: *backend_env
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      scraper-mcp:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  generic-matcher:
+    image: aiworks-backend:latest
+    command: ["uvicorn", "agents.templates.matcher_main:app", "--host", "0.0.0.0", "--port", "8005"]
+    environment: *backend_env
+    ports:
+      - "8005:8005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8005/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
+    image: aiworks-web:latest
+    environment:
+      # Server Components call the API from inside this container; localhost would be wrong.
+      API_URL: http://control-plane:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

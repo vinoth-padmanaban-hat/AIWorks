@@ -18,6 +18,9 @@ DB split
 
 Setup (run once before this script)
 ------------------------------------
+  Docker:  make docker-migrate   (applies control-plane + tenant SQL; idempotent)
+
+  Manual psql:
   psql $DATABASE_URL -f db/migrations/001_schema.sql
   psql $DATABASE_URL -f db/migrations/002_tenant_policies.sql
   psql $DATABASE_URL -f db/migrations/003_tenant_db_connections.sql
@@ -37,10 +40,12 @@ Setup (run once before this script)
   done
 
   uv run python scripts/seed_content_tenants.py
+  # Re-apply: add --force (otherwise skips if demo tenant 00000000-...-0001 exists)
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -760,7 +765,26 @@ async def _seed_tenant_db(t: dict, now: datetime) -> None:
 # ── Main seed routine ──────────────────────────────────────────────────────────
 
 
-async def seed() -> None:
+async def seed(*, force: bool = False) -> None:
+    marker_id = TENANTS[0]["id"]
+    if not force:
+        async with AsyncSessionLocal() as db:
+            row = (
+                await db.execute(
+                    text("SELECT 1 FROM tenants WHERE id = CAST(:id AS uuid) LIMIT 1"),
+                    {"id": marker_id},
+                )
+            ).first()
+            if row is not None:
+                logger.info(_SEP)
+                logger.info(
+                    "Demo seed already present (tenant id=%s). Skipping. "
+                    "Use: uv run python scripts/seed_content_tenants.py --force",
+                    marker_id,
+                )
+                logger.info(_SEP)
+                return
+
     now = datetime.now(timezone.utc)
 
     logger.info(_SEP)
@@ -821,4 +845,13 @@ async def seed() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    parser = argparse.ArgumentParser(
+        description="Seed PoC tenants (skips if demo tenant already exists unless --force).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-apply seed even when the first demo tenant already exists.",
+    )
+    args = parser.parse_args()
+    asyncio.run(seed(force=args.force))
