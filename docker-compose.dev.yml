@@ -50,22 +50,14 @@ services:
       WATCHFILES_FORCE_POLLING: "true"
 
   scraper-mcp:
-    command:
-      [
-        "uvicorn",
-        "tools.scraper_mcp.server:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8002",
-        "--reload",
-      ]
+    command: ["python", "-m", "tools.scraper_mcp.server"]
     volumes:
       - ./app:/app/app
       - ./agents:/app/agents
       - ./tools:/app/tools
       - ./scripts:/app/scripts
     environment:
+      HOME: /tmp
       WATCHFILES_FORCE_POLLING: "true"
 
   content-curator:

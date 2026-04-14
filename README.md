@@ -1,12 +1,12 @@
 # AIWorks
 
-Multi-tenant **agentic platform** PoC: a **FastAPI control plane** (orchestrator, planner, execution engine, admin API) coordinates **HTTP agent services** (content ingestion, curation, scraper MCP, generic template agents). Data lives in **PostgreSQL** — one **control-plane** database plus **per-tenant** databases. A **Next.js** app in `web/` provides an admin UI.
+Multi-tenant **agentic platform** PoC: a **FastAPI control plane** (orchestrator, planner, execution engine, admin API) coordinates agent services (content ingestion, curation, generic template agents) plus a **FastMCP scraper server**. Data lives in **PostgreSQL** — one **control-plane** database plus **per-tenant** databases. A **Next.js** app in `web/` provides an admin UI.
 
 ## Architecture (short)
 
 - **Control plane** (`app/`, port **8000**): `POST /execute`, `GET /admin/*`, `GET /health`. Dispatches work using the skill/agent registries in Postgres.
-- **Agents** (`agents/`, **8001–8005**): LangGraph pipelines and tools; call the scraper MCP over HTTP where needed.
-- **Scraper MCP** (`tools/scraper_mcp/`, **8002**): crawl4ai / Playwright + fallbacks; needs extra **shared memory** in Docker (`shm_size`).
+- **Agents** (`agents/`, **8001–8005**): LangGraph pipelines and tools; call scraper tools via FastMCP.
+- **Scraper MCP** (`tools/scraper_mcp/`, **8002**, endpoint `/mcp`): FastMCP + crawl4ai / Playwright + fallbacks; needs extra **shared memory** in Docker (`shm_size`).
 - **Web** (`web/`, **3000**): admin UI; browser calls the API on the host; server components use `API_URL` when the UI runs in Docker (see [Web + API](#web--api)).
 
 More detail: [`architecture.md`](architecture.md), [`docs/`](docs/).

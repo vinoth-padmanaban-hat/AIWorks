@@ -159,7 +159,7 @@ local-up:
 	@echo "Run Postgres locally, apply db/migrations (see docker/init-db.sh for file order), then:"
 	@echo "  cd $(ROOT) && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 	@echo "  cd $(ROOT) && uv run uvicorn agents.content_ingestion.main:app --port 8001 --reload"
-	@echo "  cd $(ROOT) && uv run uvicorn tools.scraper_mcp.server:app --port 8002 --reload"
+	@echo "  cd $(ROOT) && uv run python -m tools.scraper_mcp.server"
 	@echo "  cd $(ROOT) && uv run uvicorn agents.content_curator.main:app --port 8003 --reload"
 	@echo "  cd $(ROOT) && uv run uvicorn agents.templates.scraper_main:app --port 8004 --reload"
 	@echo "  cd $(ROOT) && uv run uvicorn agents.templates.matcher_main:app --port 8005 --reload"

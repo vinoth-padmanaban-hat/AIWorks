@@ -109,8 +109,10 @@ services:
 
   scraper-mcp:
     image: aiworks-backend:latest
-    command: ["uvicorn", "tools.scraper_mcp.server:app", "--host", "0.0.0.0", "--port", "8002"]
-    environment: *backend_env
+    command: ["python", "-m", "tools.scraper_mcp.server"]
+    environment:
+      <<: *backend_env
+      HOME: /tmp
     ports:
       - "8002:8002"
     shm_size: "2gb"
@@ -119,12 +121,6 @@ services:
         condition: service_healthy
       control-plane:
         condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8002/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 6
-      start_period: 25s
 
   content-curator:
     image: aiworks-backend:latest
