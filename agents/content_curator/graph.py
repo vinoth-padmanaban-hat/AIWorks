@@ -18,7 +18,6 @@ import json
 import logging
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
@@ -32,6 +31,7 @@ from app.core.tenant_db import get_tenant_db_session
 from tools.scraper_mcp.client import ScraperMCPClient
 from tools.scraper_mcp.helpers import (
     compact_media_payload,
+    content_hash,
     html_to_text,
     pick_primary_image_url,
 )
@@ -71,6 +71,7 @@ class CurationState(TypedDict, total=False):
     tag_taxonomy: list[str]
     # Node 2: scrape
     scraped_pages: list[dict]
+    applied_scraping_configs: list[dict]
     sources_scraped: int
     pages_fetched: int
     # Node 3: extract
@@ -99,12 +100,6 @@ def _now() -> datetime:
 
 def _budget_limit(policy: dict) -> float:
     return float(policy.get("budget", {}).get("perExecutionUsdLimit", 1.0))
-
-
-def _url_matches_exclude(url: str, exclude_patterns: list[str]) -> bool:
-    if not exclude_patterns:
-        return False
-    return any(p and p in url for p in exclude_patterns)
 
 
 # ── Node 1: load_config ───────────────────────────────────────────────────────
@@ -188,104 +183,102 @@ async def scrape_sources(state: CurationState) -> dict:
 
     tid = uuid.UUID(state["tenant_id"])
     scraped_pages: list[dict] = []
+    applied_scraping_configs: list[dict] = []
     total_scraped = 0
     total_fetched = 0
+
+    policy_limits = (state.get("effective_policy") or {}).get("scraping_limits", {})
 
     async with get_tenant_db_session(tid) as db:
         for src in state.get("sources", []):
             root_url = src["url"]
-            max_depth = min(int(src.get("max_depth", 1)), settings.ingestion_max_depth_cap)
+            max_depth = int(src.get("max_depth", 1))
             same_domain = src.get("same_domain_only", True)
             include_pats = src.get("include_patterns", [])
             exclude_pats = list(src.get("exclude_patterns") or [])
             max_child = int(src.get("max_child_links_per_page", 4))
-            max_total = min(
-                int(src.get("max_links_to_scrape", 25)),
-                settings.ingestion_max_links_per_source,
+            max_total = int(src.get("max_links_to_scrape", 25))
+
+            # Source of truth: tenant DB source settings.
+            # Policy-level limits act only as fallback/defaults for fields not in tenant_sources.
+            scraping_config: dict[str, Any] = {
+                **policy_limits,
+                "max_depth": max_depth,
+                "max_links_per_page": max_child,
+                "max_total_links": max_total,
+                "allow_external_domains": not same_domain,
+            }
+            applied_scraping_configs.append(
+                {
+                    "source_id": src["id"],
+                    "source_url": root_url,
+                    "scraping_config": scraping_config,
+                }
             )
-
-            queue: deque[tuple[str, int]] = deque([(root_url, 0)])
-            visited: set[str] = {root_url}
-
-            while queue:
-                if len(visited) > max_total:
-                    break
-                url, depth = queue.popleft()
-                total_fetched += 1
-
-                last_hash = src.get("last_content_hash") if url == root_url else None
-                result = await scraper.fetch_page_full(
-                    url=url,
-                    last_content_hash=last_hash,
+            try:
+                crawl_result = await scraper.deep_crawl(
+                    seed_url=root_url,
+                    strategy="bfs",
+                    max_depth=max_depth,
+                    max_pages=max_total,
+                    include_external=not same_domain,
+                    include_patterns=include_pats if include_pats else None,
+                    exclude_patterns=exclude_pats if exclude_pats else None,
                     include_media=True,
-                    include_links=False,
-                    include_raw_html=True,
+                    scraping_config=scraping_config,
                 )
+            except Exception as exc:
+                logger.warning("  DEEP_CRAWL_EXCEPTION  source=%s  %s", root_url, exc)
+                continue
+            if crawl_result.error:
+                logger.warning("  DEEP_CRAWL_ERROR  source=%s  %s", root_url, crawl_result.error)
+                continue
 
-                if result.error:
-                    logger.warning("  FETCH_ERROR  url=%s  %s", url, result.error)
+            total_fetched += len(crawl_result.pages)
+
+            root_hash: str | None = None
+            for page in crawl_result.pages[:max_total]:
+                if page.error or page.status_code in (0, 304):
                     continue
-
-                if not result.changed or result.status_code in (0, 304):
+                if not (page.clean_text or "").strip():
                     continue
 
                 total_scraped += 1
+                page_depth = int(getattr(page, "depth", 0) or 0)
+                page_hash = content_hash(page.clean_text)
+                if page.url == root_url:
+                    root_hash = page_hash
 
-                hero = pick_primary_image_url(result.images)
-                media_refs = compact_media_payload(
-                    result.images, result.videos, result.audio
-                )
-
-                if url == root_url:
-                    await db.execute(
-                        text(
-                            "UPDATE tenant_sources "
-                            "SET last_scraped_at=:now, last_etag=:etag, last_content_hash=:hash "
-                            "WHERE id=:sid"
-                        ),
-                        {
-                            "now": _now(),
-                            "etag": getattr(result, "etag", None),
-                            "hash": result.content_hash,
-                            "sid": uuid.UUID(src["id"]),
-                        },
-                    )
+                hero = pick_primary_image_url(page.images)
+                media_refs = compact_media_payload(page.images, page.videos, page.audio)
 
                 scraped_pages.append({
                     "source_id": src["id"],
-                    "url": url,
-                    "raw_html": result.raw_html,
-                    "clean_text": result.clean_text,
-                    "title": result.title,
-                    "content_hash": result.content_hash,
-                    "depth": depth,
+                    "url": page.url,
+                    "raw_html": "",
+                    "clean_text": page.clean_text,
+                    "title": page.title,
+                    "content_hash": page_hash,
+                    "depth": page_depth,
                     "min_text_chars": src.get("min_text_chars", 40),
                     "require_title": src.get("require_title", True),
                     "img_url": hero,
                     "media_refs": media_refs,
                 })
 
-                if depth < max_depth:
-                    try:
-                        links_result = await scraper.fetch_links(
-                            url=url,
-                            same_domain_only=same_domain,
-                            include_patterns=include_pats if include_pats else None,
-                        )
-                        if not links_result.error:
-                            candidates = [
-                                link.href
-                                for link in links_result.links
-                                if link.href not in visited
-                                and not _url_matches_exclude(link.href, exclude_pats)
-                            ]
-                            for child_url in candidates[:max_child]:
-                                if len(visited) >= max_total:
-                                    break
-                                visited.add(child_url)
-                                queue.append((child_url, depth + 1))
-                    except Exception as exc:
-                        logger.warning("  fetch_links error for %s: %s", url, exc)
+            if root_hash:
+                await db.execute(
+                    text(
+                        "UPDATE tenant_sources "
+                        "SET last_scraped_at=:now, last_content_hash=:hash "
+                        "WHERE id=:sid"
+                    ),
+                    {
+                        "now": _now(),
+                        "hash": root_hash,
+                        "sid": uuid.UUID(src["id"]),
+                    },
+                )
 
         await db.commit()
 
@@ -295,6 +288,7 @@ async def scrape_sources(state: CurationState) -> dict:
     )
     return {
         "scraped_pages": scraped_pages,
+        "applied_scraping_configs": applied_scraping_configs,
         "sources_scraped": total_scraped,
         "pages_fetched": total_fetched,
     }
@@ -331,11 +325,24 @@ async def extract_content(state: CurationState) -> dict:
             article_id = uuid.uuid4()
             img_url = page.get("img_url")
 
+            # Matcher reads `articles` from this node only. DO NOTHING skips URLs already in DB,
+            # so repeat runs scraped pages but matched nothing — upsert + RETURNING fixes that.
+            existed = await db.execute(
+                text("SELECT 1 FROM articles WHERE url = :url LIMIT 1"),
+                {"url": page["url"]},
+            )
+            is_new_url = existed.fetchone() is None
+
             result = await db.execute(
                 text(
                     "INSERT INTO articles (id, source_id, url, title, text, img_url, created_at) "
                     "VALUES (:id, :sid, :url, :title, :text, :img, :now) "
-                    "ON CONFLICT (url) DO NOTHING RETURNING id"
+                    "ON CONFLICT (url) DO UPDATE SET "
+                    "  source_id = EXCLUDED.source_id, "
+                    "  title = EXCLUDED.title, "
+                    "  text = EXCLUDED.text, "
+                    "  img_url = COALESCE(EXCLUDED.img_url, articles.img_url) "
+                    "RETURNING id"
                 ),
                 {
                     "id": article_id,
@@ -347,11 +354,12 @@ async def extract_content(state: CurationState) -> dict:
                     "now": _now(),
                 },
             )
-            inserted = result.fetchone()
-            if inserted:
-                new_count += 1
+            row = result.fetchone()
+            if row:
+                if is_new_url:
+                    new_count += 1
                 articles.append({
-                    "id": str(article_id),
+                    "id": str(row.id),
                     "source_id": page["source_id"],
                     "url": page["url"],
                     "title": title,
@@ -362,7 +370,12 @@ async def extract_content(state: CurationState) -> dict:
 
         await db.commit()
 
-    logger.info("  extracted %d new articles from %d pages", new_count, len(state.get("scraped_pages", [])))
+    logger.info(
+        "  extracted %d new rows, %d articles for matcher (from %d pages)",
+        new_count,
+        len(articles),
+        len(state.get("scraped_pages", [])),
+    )
     return {"articles": articles, "articles_extracted": new_count}
 
 
@@ -625,6 +638,7 @@ async def save_results(state: CurationState) -> dict:
         "articles_extracted": state.get("articles_extracted", 0),
         "newsletter_articles_created": state.get("newsletter_count", 0),
         "products_matched": state.get("products_matched", 0),
+        "applied_scraping_configs": state.get("applied_scraping_configs", []),
         "total_tokens_in": state.get("total_tokens_in", 0),
         "total_tokens_out": state.get("total_tokens_out", 0),
         "estimated_cost_usd": round(state.get("estimated_cost_usd", 0.0), 6),
@@ -753,6 +767,7 @@ async def run_curation_graph(
         "products": [],
         "tag_taxonomy": [],
         "scraped_pages": [],
+        "applied_scraping_configs": [],
         "sources_scraped": 0,
         "pages_fetched": 0,
         "articles": [],

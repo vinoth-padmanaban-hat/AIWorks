@@ -22,8 +22,11 @@ import hashlib
 import logging
 import re
 import time
+from collections.abc import AsyncIterable
 from typing import Any
 from urllib.parse import urljoin, urlparse
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,23 @@ def compact_media_payload(
 _shared_crawler: Any = None
 _init_lock = asyncio.Lock()
 _arun_lock = asyncio.Lock()
+
+
+async def _collect_arun_results(arun_result: Any) -> list[Any]:
+    """
+    Normalize crawl4ai arun() output across versions.
+    Some versions return an async iterable, others return a list/single result.
+    """
+    if isinstance(arun_result, AsyncIterable):
+        out: list[Any] = []
+        async for item in arun_result:
+            out.append(item)
+        return out
+    if isinstance(arun_result, list):
+        return arun_result
+    if arun_result is None:
+        return []
+    return [arun_result]
 
 
 # ── Browser / crawler lifecycle ───────────────────────────────────────────────
@@ -238,6 +258,7 @@ async def fetch_page_async(
     scroll_to_bottom: bool = False,
     stealth_mode: bool = False,
     proxy: str | None = None,
+    scraping_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         from crawl4ai import AsyncWebCrawler, BrowserConfig
@@ -339,6 +360,7 @@ async def fetch_page_full_async(
     stealth_mode: bool = False,
     proxy: str | None = None,
     last_content_hash: str | None = None,
+    scraping_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
@@ -640,19 +662,22 @@ async def discover_urls_async(
 
         discovered: list[dict[str, Any]] = []
         async with _arun_lock:
-            async for result in await _shared_crawler.arun(url=seed_url, config=run_cfg):
-                if not result.success:
-                    continue
-                url = result.url
-                depth = (result.metadata or {}).get("depth", 0)
-                parent = (result.metadata or {}).get("parent_url", "")
-                if include_patterns and not any(p in url for p in include_patterns):
-                    continue
-                if exclude_patterns and any(p in url for p in exclude_patterns):
-                    continue
-                discovered.append({"url": url, "depth": depth, "parent_url": parent})
-                if len(discovered) >= max_total_urls:
-                    break
+            arun_result = await _shared_crawler.arun(url=seed_url, config=run_cfg)
+            results = await _collect_arun_results(arun_result)
+
+        for result in results:
+            if not result.success:
+                continue
+            url = str(result.url or "")
+            depth = (result.metadata or {}).get("depth", 0)
+            parent = str((result.metadata or {}).get("parent_url") or "")
+            if include_patterns and not any(p in url for p in include_patterns):
+                continue
+            if exclude_patterns and any(p in url for p in exclude_patterns):
+                continue
+            discovered.append({"url": url, "depth": depth, "parent_url": parent})
+            if len(discovered) >= max_total_urls:
+                break
 
         duration_ms = int((time.monotonic() - t0) * 1000)
         logger.info(
@@ -726,37 +751,40 @@ async def deep_crawl_async(
 
         pages: list[dict[str, Any]] = []
         async with _arun_lock:
-            async for result in await _shared_crawler.arun(url=seed_url, config=run_cfg):
-                if not result.success:
-                    continue
-                url = result.url
-                depth = (result.metadata or {}).get("depth", 0)
-                parent = (result.metadata or {}).get("parent_url", "")
+            arun_result = await _shared_crawler.arun(url=seed_url, config=run_cfg)
+            results = await _collect_arun_results(arun_result)
 
-                if include_patterns and not any(p in url for p in include_patterns):
-                    continue
-                if exclude_patterns and any(p in url for p in exclude_patterns):
-                    continue
+        for result in results:
+            if not result.success:
+                continue
+            url = str(result.url or "")
+            depth = (result.metadata or {}).get("depth", 0)
+            parent = str((result.metadata or {}).get("parent_url") or "")
 
-                clean_text = result.markdown or result.cleaned_html or ""
-                media = _extract_media(result) if include_media else {"images": [], "videos": [], "audio": []}
+            if include_patterns and not any(p in url for p in include_patterns):
+                continue
+            if exclude_patterns and any(p in url for p in exclude_patterns):
+                continue
 
-                pages.append({
-                    "url": url,
-                    "depth": depth,
-                    "parent_url": parent,
-                    "clean_text": clean_text,
-                    "title": (result.metadata or {}).get("title", ""),
-                    "metadata": _extract_metadata(result),
-                    "images": media["images"],
-                    "videos": media["videos"],
-                    "audio": media["audio"],
-                    "status_code": result.status_code or 200,
-                    "error": None,
-                })
+            clean_text = result.markdown or result.cleaned_html or ""
+            media = _extract_media(result) if include_media else {"images": [], "videos": [], "audio": []}
 
-                if len(pages) >= max_pages:
-                    break
+            pages.append({
+                "url": url,
+                "depth": depth,
+                "parent_url": parent,
+                "clean_text": clean_text,
+                "title": str((result.metadata or {}).get("title") or ""),
+                "metadata": _extract_metadata(result),
+                "images": media["images"],
+                "videos": media["videos"],
+                "audio": media["audio"],
+                "status_code": result.status_code or 200,
+                "error": None,
+            })
+
+            if len(pages) >= max_pages:
+                break
 
         duration_ms = int((time.monotonic() - t0) * 1000)
         logger.info(
@@ -847,7 +875,7 @@ async def extract_structured_async(
 ) -> dict[str, Any]:
     t0 = time.monotonic()
     try:
-        from crawl4ai import CacheMode, CrawlerRunConfig
+        from crawl4ai import CacheMode, CrawlerRunConfig, LLMConfig
         from crawl4ai.extraction_strategy import LLMExtractionStrategy
     except ImportError:
         return {"url": url, "data": None, "duration_ms": 0, "error": "crawl4ai not installed"}
@@ -857,7 +885,14 @@ async def extract_structured_async(
         if _shared_crawler is None:
             return {"url": url, "data": None, "duration_ms": 0, "error": "crawl4ai not available"}
 
-        extraction = LLMExtractionStrategy(schema=schema_json, verbose=False)
+        extraction = LLMExtractionStrategy(
+            schema=schema_json,
+            verbose=False,
+            llm_config=LLMConfig(
+                provider=f"openai/{settings.openai_model}",
+                api_token=settings.openai_api_key or None,
+            ),
+        )
         run_cfg = CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             wait_for=wait_for,
@@ -891,7 +926,7 @@ async def extract_structured_async(
                 "duration_ms": int((time.monotonic() - t0) * 1000), "error": str(exc)}
 
 
-# ── 9. extract_structured_no_llm — CSS/XPath schema extraction ───────────────
+# ── 9. extract_structured_no_llm — JsonCssExtractionStrategy (CSS selectors) ───
 
 async def extract_structured_no_llm_async(
     url: str,
@@ -900,17 +935,78 @@ async def extract_structured_no_llm_async(
     js_code: str | None = None,
 ) -> dict[str, Any]:
     """
-    extraction_schema follows crawl4ai JsonCssExtractionStrategy format:
-    {
-      "name": "Articles",
-      "baseSelector": "article.post",
-      "fields": [
-        {"name": "title", "selector": "h1.title", "type": "text"},
-        {"name": "url",   "selector": "a.read-more", "type": "attribute", "attribute": "href"}
-      ]
-    }
+    CSS-based structured extraction via crawl4ai ``JsonCssExtractionStrategy``.
+
+    **Reference (non-LLM strategies overview, manual CSS/XPath/regex, nesting, ``generate_schema``):**
+    https://docs.crawl4ai.com/assets/llm.txt/txt/extraction-no-llm.txt
+
+    **This function implements only** ``JsonCssExtractionStrategy`` (CSS selectors). Pass the
+    schema dict described in that doc under “Manual CSS/XPath Strategies” — including
+    ``baseSelector``, optional ``baseFields``, ``fields``, and nested field types such as
+    ``nested_list``, ``nested``, and ``list`` with recursive ``fields``.
+
+    **Not implemented here** (use crawl4ai in-process or extend the MCP): ``JsonXPathExtractionStrategy``,
+    ``RegexExtractionStrategy``, and ``JsonCssExtractionStrategy.generate_schema`` (one-shot LLM schema generation).
+
+    **Shorthand** (field name → selector string) is expanded by ``_normalize_extraction_schema``;
+    full crawl4ai objects are passed through unchanged when they already include ``baseSelector``
+    and a ``fields`` list.
     """
     t0 = time.monotonic()
+
+    def _normalize_extraction_schema(schema: dict[str, Any]) -> dict[str, Any]:
+        """
+        Accept either crawl4ai-native schema or shorthand key->selector format.
+        Shorthand examples supported:
+        - {"title": "h1", "links": "a[href]"}
+        - {"baseSelector": "article", "title": "h2", "url": "a[href]"}
+        """
+        if not isinstance(schema, dict):
+            return {
+                "name": "ExtractedItems",
+                "baseSelector": "body",
+                "fields": [],
+            }
+
+        # Already in expected crawl4ai format.
+        if "baseSelector" in schema and isinstance(schema.get("fields"), list):
+            return schema
+
+        base_selector = str(schema.get("baseSelector") or "body")
+        name = str(schema.get("name") or "ExtractedItems")
+
+        skip_keys = {
+            "name",
+            "baseSelector",
+            "fields",
+            "base_selector",
+            "selector",
+            "selectors",
+        }
+        fields: list[dict[str, Any]] = []
+
+        for field_name, field_selector in schema.items():
+            if field_name in skip_keys:
+                continue
+            if not isinstance(field_selector, str) or not field_selector.strip():
+                continue
+            selector = field_selector.strip()
+            field_type = "attribute" if "[href]" in selector else "text"
+            field: dict[str, Any] = {
+                "name": str(field_name),
+                "selector": selector,
+                "type": field_type,
+            }
+            if field_type == "attribute":
+                field["attribute"] = "href"
+            fields.append(field)
+
+        return {
+            "name": name,
+            "baseSelector": base_selector,
+            "fields": fields,
+        }
+
     try:
         from crawl4ai import CacheMode, CrawlerRunConfig
         from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
@@ -922,7 +1018,8 @@ async def extract_structured_no_llm_async(
         if _shared_crawler is None:
             return {"url": url, "data": None, "duration_ms": 0, "error": "crawl4ai not available"}
 
-        extraction = JsonCssExtractionStrategy(schema=extraction_schema, verbose=False)
+        normalized_schema = _normalize_extraction_schema(extraction_schema)
+        extraction = JsonCssExtractionStrategy(schema=normalized_schema, verbose=False)
         run_cfg = CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             wait_for=wait_for,

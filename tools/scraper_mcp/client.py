@@ -1,38 +1,4 @@
-"""
-Async HTTP client for the Scraper MCP service.
-
-Exposes all 9 tools as typed async methods.
-
-Usage:
-    client = ScraperMCPClient(base_url="http://localhost:8002")
-
-    # Single page text
-    page = await client.fetch_page("https://example.com")
-
-    # Full page with media
-    full = await client.fetch_page_full("https://example.com", include_media=True)
-
-    # Parallel batch
-    pages = await client.fetch_pages_batch(["https://a.com", "https://b.com"])
-
-    # Links from a page
-    links = await client.fetch_links("https://example.com", same_domain_only=True)
-
-    # Fast URL discovery (no content)
-    urls = await client.discover_urls("https://example.com", max_depth=2)
-
-    # Full deep crawl
-    crawl = await client.deep_crawl("https://example.com/blog", strategy="bfs", max_depth=2)
-
-    # Screenshot
-    shot = await client.screenshot_page("https://example.com")
-
-    # LLM-based extraction
-    data = await client.extract_structured("https://example.com", schema_json={...})
-
-    # CSS/XPath extraction (no LLM)
-    data = await client.extract_structured_no_llm("https://example.com", extraction_schema={...})
-"""
+"""Async FastMCP client for the scraper MCP server."""
 
 from __future__ import annotations
 
@@ -40,7 +6,7 @@ import logging
 import time
 from typing import Any
 
-import httpx
+from fastmcp import Client
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
@@ -177,19 +143,44 @@ class ExtractStructuredResult(BaseModel):
 
 class ScraperMCPClient:
     def __init__(self, base_url: str, timeout_seconds: float = 600.0) -> None:
-        self._base = base_url.rstrip("/")
-        self._timeout = httpx.Timeout(connect=30.0, read=timeout_seconds,
-                                      write=timeout_seconds, pool=30.0)
+        clean = base_url.rstrip("/")
+        self._endpoint = clean if clean.endswith("/mcp") else f"{clean}/mcp"
+        self._timeout = timeout_seconds
 
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _call(self, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         t0 = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as http:
-                resp = await http.post(f"{self._base}{path}", json=payload)
-                resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as exc:
-            logger.warning("[ScraperClient] %s failed: %s", path, exc)
+            client = Client(self._endpoint)
+            async with client:
+                result = await client.call_tool(tool_name, payload, timeout=self._timeout)
+                data: Any = result.data
+
+                # FastMCP commonly returns Root(...) wrappers (including nested fields).
+                # Normalize to plain dict/list for Pydantic validation.
+                def _plain(v: Any) -> Any:
+                    if hasattr(v, "model_dump"):
+                        return _plain(v.model_dump())
+                    if hasattr(v, "__dict__"):
+                        return {k: _plain(val) for k, val in dict(v.__dict__).items()}
+                    if isinstance(v, dict):
+                        return {k: _plain(val) for k, val in v.items()}
+                    if isinstance(v, list):
+                        return [_plain(val) for val in v]
+                    if isinstance(v, tuple):
+                        return [_plain(val) for val in v]
+                    return v
+
+                data = _plain(data)
+                if isinstance(data, dict) and "result" in data and len(data) == 1:
+                    inner = data["result"]
+                    if isinstance(inner, dict):
+                        return inner
+                    return {"result": inner}
+                if isinstance(data, dict):
+                    return data
+                return {"result": data}
+        except Exception as exc:
+            logger.warning("[ScraperClient] %s failed: %s", tool_name, exc)
             return {"error": str(exc), "duration_ms": int((time.monotonic() - t0) * 1000)}
 
     # ── 1. fetch_page ──────────────────────────────────────────────────────────
@@ -209,7 +200,7 @@ class ScraperMCPClient:
         last_etag: str | None = None,
         last_modified: str | None = None,
     ) -> FetchPageResult:
-        data = await self._post("/tools/fetch_page", {
+        data = await self._call("fetch_page", {"req": {
             "url": url,
             "last_content_hash": last_content_hash,
             "wait_for": wait_for,
@@ -219,7 +210,7 @@ class ScraperMCPClient:
             "stealth_mode": stealth_mode,
             "proxy": proxy,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         return FetchPageResult(url=url, status_code=0, changed=False,
                                content_hash="", duration_ms=0, **data) \
             if "error" in data and "status_code" not in data \
@@ -243,7 +234,7 @@ class ScraperMCPClient:
         last_content_hash: str | None = None,
         scraping_config: dict[str, Any] | None = None,
     ) -> FetchPageFullResult:
-        data = await self._post("/tools/fetch_page_full", {
+        data = await self._call("fetch_page_full", {"req": {
             "url": url,
             "include_media": include_media,
             "include_links": include_links,
@@ -257,7 +248,7 @@ class ScraperMCPClient:
             "proxy": proxy,
             "last_content_hash": last_content_hash,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         # _post returns only {error, duration_ms} on HTTP/network failure — same as fetch_page.
         if "error" in data and "status_code" not in data:
             return FetchPageFullResult(
@@ -284,14 +275,14 @@ class ScraperMCPClient:
         js_code: str | None = None,
         scraping_config: dict[str, Any] | None = None,
     ) -> list[FetchPageFullResult]:
-        data = await self._post("/tools/fetch_pages_batch", {
+        data = await self._call("fetch_pages_batch", {"req": {
             "urls": urls,
             "include_media": include_media,
             "include_links": include_links,
             "wait_for": wait_for,
             "js_code": js_code,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         out: list[FetchPageFullResult] = []
         for p in data.get("pages", []):
             if isinstance(p, dict) and "error" in p and "status_code" not in p:
@@ -321,7 +312,7 @@ class ScraperMCPClient:
         max_links: int = 200,
         scraping_config: dict[str, Any] | None = None,
     ) -> FetchLinksResult:
-        data = await self._post("/tools/fetch_links", {
+        data = await self._call("fetch_links", {"req": {
             "url": url,
             "same_domain_only": same_domain_only,
             "include_patterns": include_patterns or [],
@@ -330,7 +321,7 @@ class ScraperMCPClient:
             "session_id": session_id,
             "max_links": max_links,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         return FetchLinksResult.model_validate(data)
 
     # ── 5. discover_urls ───────────────────────────────────────────────────────
@@ -345,7 +336,7 @@ class ScraperMCPClient:
         exclude_patterns: list[str] | None = None,
         scraping_config: dict[str, Any] | None = None,
     ) -> DiscoverUrlsResult:
-        data = await self._post("/tools/discover_urls", {
+        data = await self._call("discover_urls", {"req": {
             "seed_url": seed_url,
             "max_depth": max_depth,
             "max_total_urls": max_total_urls,
@@ -353,7 +344,7 @@ class ScraperMCPClient:
             "include_patterns": include_patterns or [],
             "exclude_patterns": exclude_patterns or [],
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         return DiscoverUrlsResult.model_validate(data)
 
     # ── 6. deep_crawl ──────────────────────────────────────────────────────────
@@ -371,7 +362,7 @@ class ScraperMCPClient:
         query: str | None = None,
         scraping_config: dict[str, Any] | None = None,
     ) -> DeepCrawlResult:
-        data = await self._post("/tools/deep_crawl", {
+        data = await self._call("deep_crawl", {"req": {
             "seed_url": seed_url,
             "strategy": strategy,
             "max_depth": max_depth,
@@ -382,7 +373,16 @@ class ScraperMCPClient:
             "include_media": include_media,
             "query": query,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
+        if "error" in data and "seed_url" not in data:
+            return DeepCrawlResult(
+                seed_url=seed_url,
+                strategy=strategy,
+                pages=[],
+                total=0,
+                duration_ms=int(data.get("duration_ms") or 0),
+                error=str(data.get("error") or "unknown error"),
+            )
         return DeepCrawlResult.model_validate(data)
 
     # ── 7. screenshot_page ─────────────────────────────────────────────────────
@@ -395,13 +395,13 @@ class ScraperMCPClient:
         js_code: str | None = None,
         scraping_config: dict[str, Any] | None = None,
     ) -> ScreenshotResult:
-        data = await self._post("/tools/screenshot_page", {
+        data = await self._call("screenshot_page", {"req": {
             "url": url,
             "wait_for": wait_for,
             "full_page": full_page,
             "js_code": js_code,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         return ScreenshotResult.model_validate(data)
 
     # ── 8. extract_structured ──────────────────────────────────────────────────
@@ -414,13 +414,13 @@ class ScraperMCPClient:
         js_code: str | None = None,
         scraping_config: dict[str, Any] | None = None,
     ) -> ExtractStructuredResult:
-        data = await self._post("/tools/extract_structured", {
+        data = await self._call("extract_structured", {"req": {
             "url": url,
             "schema_json": schema_json,
             "wait_for": wait_for,
             "js_code": js_code,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         return ExtractStructuredResult.model_validate(data)
 
     # ── 9. extract_structured_no_llm ───────────────────────────────────────────
@@ -433,11 +433,11 @@ class ScraperMCPClient:
         js_code: str | None = None,
         scraping_config: dict[str, Any] | None = None,
     ) -> ExtractStructuredResult:
-        data = await self._post("/tools/extract_structured_no_llm", {
+        data = await self._call("extract_structured_no_llm", {"req": {
             "url": url,
             "extraction_schema": extraction_schema,
             "wait_for": wait_for,
             "js_code": js_code,
             **({"scraping_config": scraping_config} if scraping_config else {}),
-        })
+        }})
         return ExtractStructuredResult.model_validate(data)
